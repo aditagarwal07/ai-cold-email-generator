@@ -42,7 +42,7 @@ if submit:
                 Provide a Subject Line, Body, and Call to Action for Option 1, Option 2, and Option 3.
                 """
                 response = client.models.generate_content(
-                    model='gemini-2.5-flash',
+                    model='gemini-1.5-flash',
                     contents=prompt
                 )
                 st.success("Your Emails are Ready!")

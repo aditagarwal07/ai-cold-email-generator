@@ -42,19 +42,22 @@ if submit:
                 Provide a Subject Line, Body, and Call to Action for Option 1, Option 2, and Option 3.
                 """
                 response = client.models.generate_content(
-                    model='gemini-3.6-flash',
-                    contents=prompt
-                )
-                # --- Make.com Email Delivery Integration ---
+        model='gemini-3.6-flash',
+        contents=prompt
+    )
+
+    # Display generated output
+    st.write(response.text)
+
+# --- Make.com Email Delivery Integration ---
 st.divider()
 st.subheader("📧 Receive Draft in Your Inbox")
 
 # 1. Text Input Field for the user's email address
 user_email = st.text_input("Enter your email address:", placeholder="name@example.com")
 
-# 2. Webhook URL (Replace with your copied link from Make.com)
+# 2. Webhook URL
 make_webhook_url = "https://hook.eu1.make.com/s51yp5visu3qc5u00vabubovwpf6b6xx"
-
 # 3. Action Button
 if st.button("🚀 Send Pitch to My Email"):
     if user_email:

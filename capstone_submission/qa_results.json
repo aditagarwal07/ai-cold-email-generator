@@ -1,0 +1,29 @@
+{
+  "scope": "Original main finalization; no capstone-v2 code merged or copied",
+  "date": "2026-10-13",
+  "python_3_12": {
+    "tests_executed": 25,
+    "passed": 25,
+    "failed": 0,
+    "fresh_manifest_install": true,
+    "pip_check": "passed"
+  },
+  "python_3_14": {
+    "tests_executed": 25,
+    "passed": 25,
+    "failed": 0
+  },
+  "browser_checks": {
+    "missing_key_startup": "passed",
+    "mocked_generation": "passed",
+    "edited_download": "passed",
+    "clipboard": "passed",
+    "mobile_no_document_overflow": "passed"
+  },
+  "live_ai_test": "not run; no local credential",
+  "public_app_verification": "not established; workspace URL access failed",
+  "make_delivery": "disabled and not tested",
+  "official_category_eligibility": "not established; definitions not supplied",
+  "notion_posts_video": "documentation/post drafts/script prepared; not published or recorded",
+  "publication": "Main publication approved; verify final commit/push receipt in repository history and the publication hand-off. No live app/API success claimed."
+}

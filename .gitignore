@@ -1,0 +1,18 @@
+# Local secrets and credentials
+.streamlit/secrets.toml
+.env
+.env.*
+!.env.example
+# Python / local tooling
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+# Local editor / OS files
+.vscode/
+.idea/
+.DS_Store
+*.log

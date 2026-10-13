@@ -1,7 +1,7 @@
 """Bounded Gemini requests with validated JSON and safe public errors."""
 import logging
+import time
 import uuid
-from dataclasses import dataclass
 import httpx
 from google import genai
 from google.genai import errors, types
@@ -9,25 +9,10 @@ from pydantic import ValidationError
 from core.models import Campaign, DraftBatch, FollowUp, WORD_LIMITS, edited_email
 from core.prompts import SYSTEM_INSTRUCTION, draft_prompt, follow_up_prompt
 from services.settings import Settings
+from services.errors import ErrorDiagnosis, GenerationError
+from services.retry import MAX_ATTEMPTS, MAX_REQUEST_TIMEOUT_MS, REQUEST_BUDGET_SECONDS, retry_delay
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class ErrorDiagnosis:
-    category: str
-    message: str
-    status_code: int | None = None
-    provider_status: str = 'UNKNOWN'
-
-
-class GenerationError(Exception):
-    """Contains only a message safe to show to the user."""
-
-    def __init__(self, message: str, *, category: str = 'unknown', reference_id: str | None = None):
-        super().__init__(message)
-        self.category = category
-        self.reference_id = reference_id
 
 
 def _provider_reasons(exc: errors.APIError) -> set[str]:
@@ -95,41 +80,76 @@ def _diagnose_error(exc: Exception) -> ErrorDiagnosis:
     return ErrorDiagnosis('unexpected', 'Generation could not be completed. Please try again or contact the app owner.')
 
 
-def _failure(diagnosis: ErrorDiagnosis, exc: Exception | None = None) -> GenerationError:
-    reference = uuid.uuid4().hex[:12]
+def _failure(diagnosis: ErrorDiagnosis, exc: Exception | None = None, *, reference_id: str | None = None) -> GenerationError:
+    reference = reference_id or uuid.uuid4().hex[:12]
     # Do not use str(exc), repr(exc), exc_info, traceback, URLs, settings, or prompts here.
     logger.warning(
         'pitchcraft_gemini_failure reference=%s exception_type=%s provider_status_code=%s provider_status=%s category=%s',
         reference, type(exc).__name__ if exc is not None else 'None',
         diagnosis.status_code, diagnosis.provider_status, diagnosis.category,
     )
-    return GenerationError(diagnosis.message, category=diagnosis.category, reference_id=reference)
+    return GenerationError(diagnosis.message, category=diagnosis.category, reference_id=reference,
+                           status_code=diagnosis.status_code, provider_status=diagnosis.provider_status)
 
 
-def _request(settings: Settings, prompt: str, schema):
+def _generate_response(settings: Settings, prompt: str, config: types.GenerateContentConfig, *, retry: bool = True):
+    """One model only. SDK retries are off; application retries have explicit limits."""
     if not settings.api_key:
         raise _failure(ErrorDiagnosis('configuration', 'Gemini is not configured. The app owner must add GEMINI_API_KEY in secrets.'))
+    reference = uuid.uuid4().hex[:12]
+    started = time.monotonic()
+    waited = 0.0
     try:
-        # SDK timeout is milliseconds. Avoid retries that silently multiply quota usage.
         with genai.Client(
             api_key=settings.api_key,
             vertexai=False,
             http_options=types.HttpOptions(
-                timeout=45000, retry_options=types.HttpRetryOptions(attempts=1)
+                timeout=MAX_REQUEST_TIMEOUT_MS, retry_options=types.HttpRetryOptions(attempts=1)
             ),
         ) as client:
-            response = client.models.generate_content(
-                model=settings.model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    response_mime_type='application/json',
-                    response_json_schema=schema.model_json_schema(),
-                    max_output_tokens=4096,
-                    temperature=0.7,
-                ),
-            )
-            text = response.text
+            for attempt in range(1, (MAX_ATTEMPTS if retry else 1) + 1):
+                remaining = REQUEST_BUDGET_SECONDS - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise _failure(ErrorDiagnosis('timeout', 'The Gemini request time budget was reached. Please try again later.'), reference_id=reference)
+                attempt_config = config.model_copy(update={'http_options': types.HttpOptions(
+                    timeout=min(MAX_REQUEST_TIMEOUT_MS, max(1, int(remaining * 1000))),
+                    retry_options=types.HttpRetryOptions(attempts=1),
+                )})
+                try:
+                    response = client.models.generate_content(model=settings.model, contents=prompt, config=attempt_config)
+                except Exception as exc:
+                    diagnosis = _diagnose_error(exc)
+                    remaining = REQUEST_BUDGET_SECONDS - (time.monotonic() - started)
+                    delay = retry_delay(exc, attempt, waited, remaining) if retry else None
+                    if delay is None:
+                        raise _failure(diagnosis, exc, reference_id=reference) from None
+                    logger.warning(
+                        'pitchcraft_gemini_retry reference=%s exception_type=%s provider_status_code=%s provider_status=%s category=%s attempt=%s delay_seconds=%.3f',
+                        reference, type(exc).__name__, diagnosis.status_code, diagnosis.provider_status,
+                        diagnosis.category, attempt, delay,
+                    )
+                    time.sleep(delay)
+                    waited += delay
+                    continue
+                if attempt > 1:
+                    logger.warning('pitchcraft_gemini_recovered reference=%s attempt=%s', reference, attempt)
+                return response
+    except GenerationError:
+        raise
+    except Exception as exc:
+        raise _failure(_diagnose_error(exc), exc, reference_id=reference) from None
+
+
+def _request(settings: Settings, prompt: str, schema, *, retry: bool = True):
+    response = _generate_response(settings, prompt, types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        response_mime_type='application/json',
+        response_json_schema=schema.model_json_schema(),
+        max_output_tokens=4096,
+        temperature=0.7,
+    ), retry=retry)
+    try:
+        text = response.text
     except Exception as exc:
         raise _failure(_diagnose_error(exc), exc) from None
     if not text or not text.strip():
@@ -140,8 +160,8 @@ def _request(settings: Settings, prompt: str, schema):
         raise _failure(ErrorDiagnosis('invalid_response', 'Gemini returned incomplete, repetitive, or invalid drafts. Please generate again.'), exc) from None
 
 
-def generate_drafts(settings: Settings, campaign: Campaign) -> DraftBatch:
-    batch = _request(settings, draft_prompt(campaign), DraftBatch)
+def generate_drafts(settings: Settings, campaign: Campaign, *, retry: bool = True) -> DraftBatch:
+    batch = _request(settings, draft_prompt(campaign), DraftBatch, retry=retry)
     for draft in batch.drafts:
         if len(draft.body.split()) > WORD_LIMITS[campaign.length]:
             raise _failure(ErrorDiagnosis('output_length', 'Gemini exceeded the selected email length. Please generate again.'))

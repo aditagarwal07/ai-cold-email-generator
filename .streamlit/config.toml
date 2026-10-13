@@ -8,3 +8,8 @@ font = "sans serif"
 
 [browser]
 gatherUsageStats = false
+
+# Production does not need file-triggered module eviction. Widget reruns still work.
+# For local development, override with --server.fileWatcherType auto.
+[server]
+fileWatcherType = "none"

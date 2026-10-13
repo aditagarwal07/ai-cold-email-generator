@@ -40,6 +40,9 @@ class SettingsTests(unittest.TestCase):
 
 class GeminiTests(unittest.TestCase):
     def setUp(self):
+        sleep_patch = patch('services.gemini_service.time.sleep')
+        self.sleep = sleep_patch.start()
+        self.addCleanup(sleep_patch.stop)
         self.patcher = patch('services.gemini_service.genai.Client')
         self.factory = self.patcher.start()
         self.addCleanup(self.patcher.stop)
@@ -101,6 +104,37 @@ class GeminiTests(unittest.TestCase):
             self.client.models.generate_content.return_value.text = text
             with self.subTest(text=str(text)[:20]), self.assertRaises(GenerationError):
                 generate_drafts(self.settings, campaign())
+
+    def test_real_sdk_http_errors_keep_safe_status_and_category(self):
+        from google.genai.client import Client
+        from google.genai import types
+
+        for code, status, category in [
+            (503, 'UNAVAILABLE', 'temporary_service'),
+            (429, 'RESOURCE_EXHAUSTED', 'quota_or_rate_limit'),
+        ]:
+            def respond(request):
+                return httpx.Response(code, json={'error': {
+                    'code': code, 'status': status, 'message': 'PRIVATE_TEST_KEY PRIVATE_CAMPAIGN_INPUT',
+                }})
+
+            def factory(**kwargs):
+                kwargs['http_options'] = types.HttpOptions(
+                    timeout=45000, retry_options=types.HttpRetryOptions(attempts=1),
+                    client_args={'transport': httpx.MockTransport(respond), 'trust_env': False},
+                )
+                return Client(**kwargs)
+
+            self.factory.side_effect = factory
+            with self.subTest(code=code), self.assertLogs('services.gemini_service', level='WARNING') as logs:
+                with self.assertRaises(GenerationError) as caught:
+                    generate_drafts(self.settings, campaign())
+            self.assertEqual(caught.exception.category, category)
+            self.assertIn(f'provider_status_code={code}', logs.output[0])
+            self.assertIn(f'provider_status={status}', logs.output[0])
+            self.assertIn(f'category={category}', logs.output[0])
+            self.assertNotIn('PRIVATE_TEST_KEY', logs.output[0])
+            self.assertNotIn('PRIVATE_CAMPAIGN_INPUT', logs.output[0])
 
     def test_length_and_cta_mismatch(self):
         data = batch_data()

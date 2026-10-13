@@ -20,6 +20,8 @@ class AppTests(unittest.TestCase):
         self.addCleanup(self.generate_patch.stop)
         self.app = AppTest.from_file(APP).run(timeout=30)
         self.assertFalse(self.app.exception)
+        # Existing Gemini regression cases explicitly select Gemini; the default is Groq.
+        self.app.selectbox('ai_provider').select('Gemini').run()
 
     def fill_campaign(self):
         for key, value in {
@@ -37,6 +39,9 @@ class AppTests(unittest.TestCase):
             app = AppTest.from_file(APP).run(timeout=30)
         self.assertFalse(app.exception)
         self.assertTrue(app.button('generate').disabled)
+        self.assertTrue(any('GROQ_API_KEY' in item.value for item in app.info))
+        with patch('services.settings.load_settings', return_value=Settings()):
+            app.selectbox('ai_provider').select('Gemini').run()
         self.assertTrue(any('GEMINI_API_KEY' in item.value for item in app.info))
 
     def test_validation_stops_api_request(self):
@@ -109,3 +114,80 @@ class AppTests(unittest.TestCase):
         self.assertTrue(any('temporary service failure' in item.value for item in self.app.error))
         self.assertTrue(any('Support reference: abcd1234ef56' in item.value for item in self.app.caption))
         self.assertFalse(self.app.exception)
+
+    def test_alternate_model_is_explicit_and_invalidates_old_drafts(self):
+        with patch('services.settings.load_settings', return_value=Settings('offline-test-key', fallback_model='gemini-flash-lite-latest')):
+            self.app.run()
+            self.fill_campaign()
+            self.assertEqual(self.generate.call_args.args[0].model, 'gemini-flash-latest')
+            self.app.session_state['last_request'] = 0
+            self.generate.side_effect = GenerationError('Temporary service failure.')
+            self.app.button('generate').click().run()
+            self.assertEqual(self.app.selectbox('model_choice').value, 'primary')
+            self.app.selectbox('model_choice').select('alternate').run()
+            self.assertTrue(self.app.button('generate_followup').disabled)
+            self.assertEqual(len(self.app.code), 0)
+            self.generate.side_effect = None
+            self.app.session_state['last_request'] = 0
+            self.app.button('generate').click().run()
+            self.assertEqual(self.generate.call_args.args[0].model, 'gemini-flash-lite-latest')
+            self.assertEqual(len(self.app.code), 1)
+            self.assertFalse(self.app.exception)
+
+    def test_synthetic_diagnostics_are_opt_in_and_separate_from_campaign(self):
+        from diagnostics.gemini_probe import ProbeResult
+        self.assertFalse(any(button.label == 'Run synthetic diagnostics' for button in self.app.button))
+        results = [ProbeResult('minimal_text', True, 200, 'success'),
+                   ProbeResult('minimal_json', True, 200, 'success'),
+                   ProbeResult('three_draft_schema', False, 503, 'temporary_service', 'abcd1234ef56')]
+        with patch('services.settings.load_settings', return_value=Settings('offline-test-key', diagnostics_enabled=True)), \
+             patch('diagnostics.gemini_probe.run_diagnostics', return_value=results) as diagnostic:
+            self.app.run()
+            next(button for button in self.app.button if button.label == 'Run synthetic diagnostics').click().run()
+            diagnostic.assert_called_once()
+            self.generate.assert_not_called()
+            self.assertEqual(len(self.app.table), 1)
+            self.assertFalse(self.app.exception)
+
+    def test_groq_is_default_and_routes_drafts_and_followups(self):
+        configured = Settings(groq_api_key='offline-groq-test-key')
+        with patch('services.settings.load_settings', return_value=configured), \
+             patch('services.groq_service.generate_drafts', return_value=batch()) as generate, \
+             patch('services.groq_service.generate_follow_up', return_value=FollowUp(
+                 subject='A quick follow-up', body='Would a short example be useful for your team?')) as followup:
+            self.app = AppTest.from_file(APP).run(timeout=30)
+            self.assertEqual(self.app.selectbox('ai_provider').value, 'Groq')
+            self.assertFalse(self.app.button('generate').disabled)
+            self.fill_campaign()
+            generate.assert_called_once()
+            self.generate.assert_not_called()
+            self.assertEqual(self.app.session_state['generated_provider'], 'Groq')
+            self.app.session_state['last_request'] = 0
+            self.app.button('generate_followup').click().run()
+            followup.assert_called_once()
+            self.assertEqual(len(self.app.code), 2)
+            self.assertFalse(self.app.exception)
+
+    def test_provider_changes_block_stale_exports_and_preserve_origin(self):
+        configured = Settings('offline-gemini-key', groq_api_key='offline-groq-key')
+        with patch('services.settings.load_settings', return_value=configured), \
+             patch('services.groq_service.generate_drafts', return_value=batch()):
+            self.app = AppTest.from_file(APP).run(timeout=30)
+            self.fill_campaign()
+            self.app.selectbox('ai_provider').select('Gemini').run()
+            self.assertTrue(self.app.button('generate_followup').disabled)
+            self.assertEqual(len(self.app.code), 0)
+            self.assertTrue(any('Drafts generated with Groq' in caption.value for caption in self.app.caption))
+            self.app.selectbox('ai_provider').select('Groq').run()
+            self.assertEqual(len(self.app.code), 1)
+            self.assertFalse(self.app.exception)
+
+    def test_groq_failure_does_not_switch_to_gemini(self):
+        configured = Settings('offline-gemini-key', groq_api_key='offline-groq-key')
+        with patch('services.settings.load_settings', return_value=configured), \
+             patch('services.groq_service.generate_drafts', side_effect=GenerationError('Groq rate limit reached.')):
+            self.app = AppTest.from_file(APP).run(timeout=30)
+            self.fill_campaign()
+            self.assertEqual(self.app.selectbox('ai_provider').value, 'Groq')
+            self.generate.assert_not_called()
+            self.assertTrue(any('Groq rate limit' in item.value for item in self.app.error))

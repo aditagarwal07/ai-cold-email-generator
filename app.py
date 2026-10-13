@@ -1,13 +1,16 @@
 """PitchCraft AI: campaign → review → export. No email delivery actions."""
 import time
 import uuid
+from dataclasses import asdict, replace
 import streamlit as st
 from pydantic import ValidationError
 from core.models import (
     Campaign, Length, Tone, claim_warnings, edited_email, email_fingerprint,
 )
-from services.gemini_service import GenerationError, generate_drafts, generate_follow_up
+from services.errors import GenerationError
+from services.ai_service import generate_drafts, generate_follow_up
 from services.settings import load_settings
+from diagnostics.gemini_probe import run_diagnostics
 
 st.set_page_config(page_title='PitchCraft AI · Cold Email & Pitch Generator', page_icon='✦', layout='wide')
 st.markdown('''<style>
@@ -45,11 +48,33 @@ with st.sidebar:
     st.subheader('Your writing workspace')
     st.write('**1. Campaign** — provide the offer and facts.\n\n**2. Review** — compare and refine.\n\n**3. Export** — copy or download.')
     st.divider()
-    if settings.api_key:
-        st.success('Gemini key configured')
+    provider = st.selectbox('AI Provider', ['Groq', 'Gemini'], key='ai_provider')
+    active_key = settings.groq_api_key if provider == 'Groq' else settings.api_key
+    key_name = 'GROQ_API_KEY' if provider == 'Groq' else 'GEMINI_API_KEY'
+    if active_key:
+        st.success(f'{provider} key configured')
     else:
-        st.info('Add GEMINI_API_KEY to app secrets to generate drafts.')
+        st.info(f'Add {key_name} to app secrets to generate drafts.')
     st.caption('Key presence does not confirm API access. Model availability and quota depend on the app owner’s account.')
+    model_choice = 'primary'
+    if provider == 'Gemini' and settings.fallback_model:
+        model_choice = st.selectbox('Model selection', ['primary', 'alternate'],
+                                   format_func=lambda value: 'Configured primary model' if value == 'primary' else 'Configured alternate model',
+                                   key='model_choice')
+        st.caption('Model changes are explicit. Failed requests never switch models automatically.')
+    effective_settings = replace(settings, model=settings.fallback_model) if model_choice == 'alternate' else settings
+    active_model = effective_settings.groq_model if provider == 'Groq' else effective_settings.model
+    st.caption('Provider changes are explicit. Failed requests never switch providers automatically.')
+    if provider == 'Gemini' and settings.diagnostics_enabled:
+        with st.expander('Synthetic Gemini diagnostics'):
+            st.caption('Makes three single-attempt requests using synthetic data and the selected model. May consume quota; no campaign data is used.')
+            if st.button('Run synthetic diagnostics', disabled=not settings.api_key) and begin_request():
+                with st.spinner('Comparing text and structured generation…'):
+                    st.session_state['diagnostic_results'] = run_diagnostics(effective_settings)
+                    st.session_state['diagnostic_model_choice'] = model_choice
+            if st.session_state.get('diagnostic_results'):
+                st.caption(f'Results for the {st.session_state["diagnostic_model_choice"]} model at the time of the test.')
+                st.table([asdict(result) for result in st.session_state['diagnostic_results']])
     st.caption('Email delivery is disabled. This app never sends email.')
     if st.button('Clear this session', use_container_width=True):
         for key in list(st.session_state):
@@ -62,7 +87,7 @@ campaign_tab, review_tab, export_tab = st.tabs(['1 · Campaign', '2 · Review & 
 
 with campaign_tab:
     st.subheader('Build your campaign')
-    st.caption('Required fields are marked *. Inputs are sent to Google Gemini when you generate. Avoid sensitive personal or confidential information.')
+    st.caption(f'Required fields are marked *. Inputs are sent to {provider} when you generate. Avoid sensitive personal or confidential information.')
     with st.container(border=True):
         st.markdown('#### Your offer')
         left, right = st.columns(2)
@@ -106,23 +131,27 @@ with campaign_tab:
             label = labels.get(error['loc'][0], str(error['loc'][0]).replace('_', ' ').capitalize())
             validation_errors.append(f'{label}: {error["msg"]}.')
 
-    if st.button('Generate 3 email drafts', type='primary', disabled=not settings.api_key, key='generate'):
+    if st.button('Generate 3 email drafts', type='primary', disabled=not active_key, key='generate'):
         if validation_errors:
             st.error('Please complete the campaign:\n\n' + '\n\n'.join(validation_errors))
         elif begin_request():
             st.session_state['generation_failed'] = False
             with st.spinner('Writing three distinct strategies…'):
                 try:
-                    batch = generate_drafts(settings, campaign)
+                    batch = generate_drafts(effective_settings, campaign, provider=provider)
                     st.session_state.update(batch=batch, campaign_fingerprint=campaign.fingerprint(),
-                                            revision=uuid.uuid4().hex, followups={})
+                                            revision=uuid.uuid4().hex, followups={}, generated_model_choice=model_choice,
+                                            generated_provider=provider, generated_model=active_model)
                     st.success('Three drafts are ready. Open “2 · Review & edit”.')
                 except GenerationError as exc:
                     st.session_state['generation_failed'] = True
                     show_generation_error(exc)
 
 batch = st.session_state.get('batch')
-stale = batch is not None and (campaign is None or campaign.fingerprint() != st.session_state.get('campaign_fingerprint'))
+stale = batch is not None and (campaign is None or campaign.fingerprint() != st.session_state.get('campaign_fingerprint')
+                              or model_choice != st.session_state.get('generated_model_choice', 'primary')
+                              or provider != st.session_state.get('generated_provider', 'Gemini')
+                              or active_model != st.session_state.get('generated_model', active_model))
 selected_subject = selected_body = ''
 selected_index = 0
 edit_valid = False
@@ -134,7 +163,8 @@ with review_tab:
         st.info('Complete your campaign and generate drafts to start reviewing.')
     else:
         if stale:
-            st.warning('Campaign inputs have changed. These are older drafts. Regenerate, or restore the original inputs, before follow-up or export.')
+            st.warning('Campaign inputs, provider, or model have changed. These are older drafts. Regenerate, or restore the original selection and inputs, before follow-up or export.')
+        st.caption(f'Drafts generated with {st.session_state.get("generated_provider", "Gemini")}.')
         if st.session_state.get('generation_failed'):
             st.warning('The latest generation failed. The drafts below are from the previous successful request.')
         st.info('Review every claim before use. Recipient facts are user-supplied; AI output is not independently verified.')
@@ -162,11 +192,11 @@ with review_tab:
         st.markdown('#### A gentle follow-up')
         st.caption('Uses the selected, edited email. No assumption that the recipient opened, read, or replied. Generating a follow-up does not send it.')
         source_id = email_fingerprint(selected_subject, selected_body)
-        if st.button('Generate a short follow-up', disabled=stale or not edit_valid or not settings.api_key, key='generate_followup'):
+        if st.button('Generate a short follow-up', disabled=stale or not edit_valid or not active_key, key='generate_followup'):
             if begin_request():
                 with st.spinner('Writing a short follow-up…'):
                     try:
-                        followup = generate_follow_up(settings, campaign, selected_subject, selected_body)
+                        followup = generate_follow_up(effective_settings, campaign, selected_subject, selected_body, provider=provider)
                         st.session_state['followups'][selected_index] = (source_id, followup)
                     except GenerationError as exc:
                         show_generation_error(exc)
@@ -188,7 +218,7 @@ with export_tab:
     if batch is None:
         st.info('Your selected draft will appear here after generation.')
     elif stale:
-        st.warning('Export is paused because your campaign changed. Generate new drafts or restore the original campaign inputs.')
+        st.warning('Export is paused because your campaign, provider, or model changed. Generate new drafts or restore the original selection and inputs.')
     elif not edit_valid:
         st.warning('Complete the selected subject and body in the review stage before exporting.')
     else:

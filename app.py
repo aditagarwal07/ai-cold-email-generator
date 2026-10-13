@@ -35,6 +35,12 @@ def begin_request() -> bool:
     return True
 
 
+def show_generation_error(exc: GenerationError) -> None:
+    st.error(str(exc))
+    if exc.reference_id:
+        st.caption(f'Support reference: {exc.reference_id}. The app owner can look up this reference in Streamlit Cloud logs.')
+
+
 with st.sidebar:
     st.subheader('Your writing workspace')
     st.write('**1. Campaign** — provide the offer and facts.\n\n**2. Review** — compare and refine.\n\n**3. Export** — copy or download.')
@@ -113,7 +119,7 @@ with campaign_tab:
                     st.success('Three drafts are ready. Open “2 · Review & edit”.')
                 except GenerationError as exc:
                     st.session_state['generation_failed'] = True
-                    st.error(str(exc))
+                    show_generation_error(exc)
 
 batch = st.session_state.get('batch')
 stale = batch is not None and (campaign is None or campaign.fingerprint() != st.session_state.get('campaign_fingerprint'))
@@ -162,7 +168,9 @@ with review_tab:
                     try:
                         followup = generate_follow_up(settings, campaign, selected_subject, selected_body)
                         st.session_state['followups'][selected_index] = (source_id, followup)
-                    except (GenerationError, ValueError) as exc:
+                    except GenerationError as exc:
+                        show_generation_error(exc)
+                    except ValueError as exc:
                         st.error(str(exc))
         saved = st.session_state.get('followups', {}).get(selected_index)
         if saved:

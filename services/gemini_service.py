@@ -1,4 +1,7 @@
 """Bounded Gemini requests with validated JSON and safe public errors."""
+import logging
+import uuid
+from dataclasses import dataclass
 import httpx
 from google import genai
 from google.genai import errors, types
@@ -7,36 +10,105 @@ from core.models import Campaign, DraftBatch, FollowUp, WORD_LIMITS, edited_emai
 from core.prompts import SYSTEM_INSTRUCTION, draft_prompt, follow_up_prompt
 from services.settings import Settings
 
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ErrorDiagnosis:
+    category: str
+    message: str
+    status_code: int | None = None
+    provider_status: str = 'UNKNOWN'
+
 
 class GenerationError(Exception):
     """Contains only a message safe to show to the user."""
 
+    def __init__(self, message: str, *, category: str = 'unknown', reference_id: str | None = None):
+        super().__init__(message)
+        self.category = category
+        self.reference_id = reference_id
 
-def _safe_error(exc: Exception) -> str:
+
+def _provider_reasons(exc: errors.APIError) -> set[str]:
+    """Inspect structured reasons locally; never log provider details or messages."""
+    payload = exc.details
+    if not isinstance(payload, dict):
+        return set()
+    error = payload.get('error', payload)
+    if not isinstance(error, dict):
+        return set()
+    details = error.get('details', [])
+    if not isinstance(details, list):
+        return set()
+    return {item['reason'] for item in details
+            if isinstance(item, dict) and isinstance(item.get('reason'), str)}
+
+
+def _diagnose_error(exc: Exception) -> ErrorDiagnosis:
     if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
-        return 'Gemini took too long to respond. Please wait briefly and try again.'
+        return ErrorDiagnosis('timeout', 'Gemini took too long to respond. Please wait briefly and try again.')
     if isinstance(exc, errors.APIError):
-        code = exc.code
-        if code in (401, 403):
-            return 'Gemini access was denied. The app owner should check the API key and permissions.'
-        if code == 400:
-            return 'Gemini rejected the request. The app owner should check the API key and model configuration.'
-        if code == 404:
-            return 'The configured Gemini model is unavailable. Ask the app owner to check GEMINI_MODEL.'
-        if code == 429:
-            return 'The Gemini usage limit has been reached. Please try later; the app owner may need to check quota.'
+        code = exc.code if type(exc.code) is int and 100 <= exc.code <= 599 else None
+        # Only allow known enum values into logs. Provider strings may contain sensitive data.
+        known_statuses = {'INVALID_ARGUMENT', 'UNAUTHENTICATED', 'PERMISSION_DENIED', 'NOT_FOUND',
+                          'RESOURCE_EXHAUSTED', 'INTERNAL', 'UNAVAILABLE', 'DEADLINE_EXCEEDED',
+                          'FAILED_PRECONDITION', 'CANCELLED', 'UNKNOWN', 'UNIMPLEMENTED'}
+        status = exc.status if isinstance(exc.status, str) and exc.status in known_statuses else 'UNKNOWN'
+        reasons = _provider_reasons(exc)
+        # Some responses omit ErrorInfo. These fixed phrases are inspected, never recorded.
+        message = exc.message.casefold() if isinstance(exc.message, str) else ''
+
+        def result(category, text):
+            return ErrorDiagnosis(category, text, code, status)
+
         if code in (408, 504):
-            return 'Gemini took too long to respond. Please try again later.'
-        if code and code >= 500:
-            return 'Gemini is temporarily unavailable. Please try again later.'
+            return result('timeout', 'Gemini took too long to respond. Please try again later.')
+        if code is not None and code >= 500:
+            return result('temporary_service', 'Gemini reported a temporary service failure. Please try again later. If it persists, the app owner should check Google’s service status and Cloud logs.')
+        if code in (400, 401, 403) and (
+            reasons & {'API_KEY_INVALID', 'API_KEY_EXPIRED'}
+            or 'api key not valid' in message or 'api key expired' in message
+        ):
+            return result('invalid_api_key', 'The Gemini API key is invalid or expired. The app owner should replace GEMINI_API_KEY in Streamlit Cloud Secrets.')
+        if code == 401:
+            return result('authentication', 'Gemini could not authenticate this app. The app owner should check GEMINI_API_KEY in Streamlit Cloud Secrets.')
+        if code == 403:
+            return result('access_denied', 'Gemini access is denied. The app owner should check API key restrictions, project permissions, and whether the Generative Language API is enabled.')
+        if code == 404 or (code == 400 and (
+            reasons & {'MODEL_NOT_FOUND', 'MODEL_NOT_SUPPORTED'}
+            or 'not supported for generatecontent' in message
+            or ('model' in message and 'not found for api version' in message)
+        )):
+            return result('model_unavailable', 'The configured Gemini model is unavailable or does not support this request. The app owner should check GEMINI_MODEL and model access in Google AI Studio.')
+        if code == 429:
+            if reasons & {'RATE_LIMIT_EXCEEDED'}:
+                return result('rate_limit', 'Gemini’s request rate limit was reached. Please wait before trying again.')
+            if reasons & {'QUOTA_EXCEEDED', 'RESOURCE_QUOTA_EXCEEDED'}:
+                return result('quota', 'The Gemini quota has been exhausted. The app owner should check project usage and quota; waiting briefly may not resolve it.')
+            return result('quota_or_rate_limit', 'A Gemini quota or rate limit was reached. Please try later; the app owner should check project usage and quota.')
+        if code == 400:
+            return result('invalid_request', 'Gemini rejected the request configuration. The app owner should check model capabilities, structured-output support, and account or regional eligibility in Cloud logs.')
+        return result('provider_error', 'Gemini rejected the request. The app owner should check the diagnostic reference in Streamlit Cloud logs.')
     if isinstance(exc, httpx.TransportError):
-        return 'Could not reach Gemini. Please check connectivity and try again.'
-    return 'Generation could not be completed. Please try again or contact the app owner.'
+        return ErrorDiagnosis('network', 'Could not reach Gemini. Please check connectivity and try again.')
+    return ErrorDiagnosis('unexpected', 'Generation could not be completed. Please try again or contact the app owner.')
+
+
+def _failure(diagnosis: ErrorDiagnosis, exc: Exception | None = None) -> GenerationError:
+    reference = uuid.uuid4().hex[:12]
+    # Do not use str(exc), repr(exc), exc_info, traceback, URLs, settings, or prompts here.
+    logger.warning(
+        'pitchcraft_gemini_failure reference=%s exception_type=%s provider_status_code=%s provider_status=%s category=%s',
+        reference, type(exc).__name__ if exc is not None else 'None',
+        diagnosis.status_code, diagnosis.provider_status, diagnosis.category,
+    )
+    return GenerationError(diagnosis.message, category=diagnosis.category, reference_id=reference)
 
 
 def _request(settings: Settings, prompt: str, schema):
     if not settings.api_key:
-        raise GenerationError('Gemini is not configured. The app owner must add GEMINI_API_KEY in secrets.')
+        raise _failure(ErrorDiagnosis('configuration', 'Gemini is not configured. The app owner must add GEMINI_API_KEY in secrets.'))
     try:
         # SDK timeout is milliseconds. Avoid retries that silently multiply quota usage.
         with genai.Client(
@@ -59,22 +131,22 @@ def _request(settings: Settings, prompt: str, schema):
             )
             text = response.text
     except Exception as exc:
-        raise GenerationError(_safe_error(exc)) from None
+        raise _failure(_diagnose_error(exc), exc) from None
     if not text or not text.strip():
-        raise GenerationError('Gemini returned no usable text. The response may have been blocked; try revising your inputs.')
+        raise _failure(ErrorDiagnosis('empty_response', 'Gemini returned no usable text. The response may have been blocked; try revising your inputs.'))
     try:
         return schema.model_validate_json(text)
-    except (ValidationError, ValueError):
-        raise GenerationError('Gemini returned incomplete, repetitive, or invalid drafts. Please generate again.') from None
+    except (ValidationError, ValueError) as exc:
+        raise _failure(ErrorDiagnosis('invalid_response', 'Gemini returned incomplete, repetitive, or invalid drafts. Please generate again.'), exc) from None
 
 
 def generate_drafts(settings: Settings, campaign: Campaign) -> DraftBatch:
     batch = _request(settings, draft_prompt(campaign), DraftBatch)
     for draft in batch.drafts:
         if len(draft.body.split()) > WORD_LIMITS[campaign.length]:
-            raise GenerationError('Gemini exceeded the selected email length. Please generate again.')
+            raise _failure(ErrorDiagnosis('output_length', 'Gemini exceeded the selected email length. Please generate again.'))
         if draft.call_to_action not in draft.body:
-            raise GenerationError('Gemini returned an inconsistent call to action. Please generate again.')
+            raise _failure(ErrorDiagnosis('output_contract', 'Gemini returned an inconsistent call to action. Please generate again.'))
     return batch
 
 

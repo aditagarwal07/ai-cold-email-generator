@@ -99,3 +99,13 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.app.text_input('input_sender_name').value, '')
         self.assertNotIn('batch', self.app.session_state)
         self.assertEqual(len(self.app.code), 0)
+
+    def test_safe_service_message_and_support_reference_are_displayed(self):
+        self.generate.side_effect = GenerationError(
+            'Gemini reported a temporary service failure.',
+            category='temporary_service', reference_id='abcd1234ef56',
+        )
+        self.fill_campaign()
+        self.assertTrue(any('temporary service failure' in item.value for item in self.app.error))
+        self.assertTrue(any('Support reference: abcd1234ef56' in item.value for item in self.app.caption))
+        self.assertFalse(self.app.exception)

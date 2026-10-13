@@ -90,6 +90,24 @@ git push origin capstone-v2
 
 No Make.com secret is needed for this MVP. The initial public app has no email-delivery capability.
 
+### Troubleshooting Gemini failures
+
+After running this version, open the app's management console in Streamlit Community
+Cloud and inspect logs for `pitchcraft_gemini_failure`. Match the `reference` field
+with the support reference displayed in the app. Each record contains only the
+exception class, numeric provider status, an allowlisted provider status name and
+an error category. Raw provider messages, tracebacks, keys, request URLs and campaign
+content are not logged by this diagnostic handler.
+
+`invalid_api_key` means a recognized invalid/expired-key error; `authentication` or
+`access_denied` points to credentials/restrictions/permissions. `model_unavailable`
+points to the model or method. `quota`, `rate_limit`, or `quota_or_rate_limit` points
+to usage limits; HTTP 429 alone cannot distinguish daily quota from request rate.
+`temporary_service` identifies HTTP 5xx other than the timeout code 504. `timeout`
+and `network` distinguish slow responses and connectivity problems. `invalid_request`
+is a remaining HTTP 400; inspect model capabilities and account eligibility.
+For non-provider failures, `provider_status_code=None` is expected.
+
 ## Tests
 
 Tests use Python's standard `unittest` runner; no testing package is needed:

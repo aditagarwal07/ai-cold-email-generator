@@ -20,7 +20,8 @@ def load_settings(secrets: Mapping | None = None) -> Settings:
                 value = secrets.get(name)
             except (FileNotFoundError, KeyError):
                 pass
-        if value is None or value == '':
+        value = value.strip() if isinstance(value, str) else ''
+        if not value:
             value = os.environ.get(name, default)
-        return str(value).strip()
+        return value.strip() if isinstance(value, str) else default
     return Settings(api_key=read('GEMINI_API_KEY'), model=read('GEMINI_MODEL', DEFAULT_MODEL) or DEFAULT_MODEL)
